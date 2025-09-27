@@ -171,6 +171,95 @@ class MLXCore:
         self.store_hypothesis_tree()
         return new_exp
 
+    # ---------- Deletion (Hypotheses / Experiments) ----------
+    def _find_parent_of_hypothesis(self, current: Hypothesis, target: Hypothesis) -> Hypothesis | None:
+        for child in current.children:
+            if child.id == target.id:
+                return current
+            found = self._find_parent_of_hypothesis(child, target)
+            if found:
+                return found
+        return None
+
+    def delete_hypothesis(self, id_prefix: str, force: bool = False) -> bool:
+        """Delete a hypothesis by ID prefix. Prevent deleting non-empty nodes unless force=True.
+
+        Behavior:
+        - If the hypothesis has children or experiments, require force=True.
+        - If deleting the root hypothesis, clear the tree (respecting force rules).
+        - If the deleted hypothesis is the head, move head to its parent (or None if root).
+        - Persist changes via store_hypothesis_tree and print a status line.
+        """
+        if self.root_hypothesis is None:
+            print(f"{Fore.RED}No hypothesis tree initialized.{Style.RESET_ALL}")
+            return False
+
+        target = self.find_hypothesis_by_prefix(id_prefix)
+        if not target:
+            print(f"{Fore.RED}Hypothesis with ID starting '{id_prefix}' not found.{Style.RESET_ALL}")
+            return False
+
+        has_children_or_exps = bool(target.children) or bool(target.experiments)
+        if has_children_or_exps and not force:
+            print(
+                f"{Fore.RED}Cannot delete hypothesis with children or experiments. "
+                f"Use --force to override.{Style.RESET_ALL}"
+            )
+            return False
+
+        # Find parent (None if target is root)
+        parent: Hypothesis | None = None
+        if self.root_hypothesis.id != target.id:
+            parent = self._find_parent_of_hypothesis(self.root_hypothesis, target)
+
+        # Perform deletion
+        if parent is None:
+            # Deleting root
+            self.root_hypothesis = None
+            self.head_hypothesis = None
+        else:
+            parent.children = [c for c in parent.children if c.id != target.id]
+            # Update head if needed
+            if self.head_hypothesis and self.head_hypothesis.id == target.id:
+                self.head_hypothesis = parent
+
+        self.store_hypothesis_tree()
+        print(
+            f"{Fore.GREEN}✓{Style.RESET_ALL} Deleted hypothesis {target.name} <{str(target.id)[:8]}>"
+        )
+        return True
+
+    def delete_experiment(self, id_prefix: str) -> bool:
+        """Delete an experiment by ID prefix from wherever it resides in the tree."""
+        if self.root_hypothesis is None:
+            print(f"{Fore.RED}No hypothesis tree initialized.{Style.RESET_ALL}")
+            return False
+
+        def find_parent_and_exp(h: Hypothesis):
+            # Search experiments in this node
+            for exp in h.experiments:
+                if str(exp.id).startswith(id_prefix):
+                    return h, exp
+            # Recurse into children
+            for c in h.children:
+                found = find_parent_and_exp(c)
+                if found:
+                    return found
+            return None
+
+        found = find_parent_and_exp(self.root_hypothesis)
+        if not found:
+            print(f"{Fore.RED}Experiment with ID starting '{id_prefix}' not found.{Style.RESET_ALL}")
+            return False
+
+        parent_h, exp = found
+        parent_h.experiments = [e for e in parent_h.experiments if e.id != exp.id]
+        self.store_hypothesis_tree()
+        print(
+            f"{Fore.GREEN}✓{Style.RESET_ALL} Deleted experiment {exp.name} <{str(exp.id)[:8]}>"
+        )
+        return True
+
     # ---------- Logging / Display ----------
     def print_log(self):
         """

@@ -51,6 +51,12 @@ def parse_arguments():
     hypo_conclude.add_argument("-m", "--notes", type=str, help="Conclusion notes/message")
     hypo_conclude.add_argument("-F", "--file", type=str, help="File containing conclusion notes")
 
+    # NEW: delete hypothesis
+    hypo_delete = hypo_sub.add_parser("delete", help="Delete a hypothesis")
+    hypo_delete.add_argument("id_prefix", type=str, help="Hypothesis ID prefix")
+    hypo_delete.add_argument("--force", action="store_true",
+                             help="Force deletion even if it has children/experiments")
+
     # experiment group (no subparsers — we parse remainder ourselves to support aliases/legacy)
     exp_parser = subparsers.add_parser("exp", help="Manage experiments")
     exp_parser.add_argument("rest", nargs=argparse.REMAINDER, help="exp subcommand and arguments")
@@ -212,8 +218,14 @@ def main():
             ok = core.conclude_hypothesis(args.id_prefix, args.status, notes)
             if not ok:
                 sys.exit(1)
+
+        elif cmd == "delete":
+            ok = core.delete_hypothesis(args.id_prefix, args.force)
+            if not ok:
+                sys.exit(1)
+
         else:
-            print("No hypothesis action specified. Use one of: create/list/show/switch/set-desc/conclude")
+            print("No hypothesis action specified. Use one of: create/list/show/switch/set-desc/conclude/delete")
             sys.exit(1)
 
     elif args.command == "exp":
@@ -223,9 +235,9 @@ def main():
         core = MLXCore(mlx_dir)
 
         rest = [r for r in (args.rest or []) if r != '--']  # drop argparse '--' separator if present
-        # Handle: add/list/show explicitly
+        # Handle: add/list/show/delete explicitly
         if not rest:
-            print("Usage:\n  mlx exp list\n  mlx exp show <id_prefix>\n  mlx exp <id_prefix>\n  mlx exp add <file_path> <name>\n  mlx exp <file_path> <name>\n")
+            print("Usage:\n  mlx exp list\n  mlx exp show <id_prefix>\n  mlx exp <id_prefix>\n  mlx exp add <file_path> <name>\n  mlx exp delete <id_prefix>\n  mlx exp <file_path> <name>\n")
             sys.exit(1)
 
         cmd = rest[0]
@@ -262,6 +274,15 @@ def main():
             print(f"Added new experiment: {new_exp.name} with ID {str(new_exp.id)[:8]}")
             return
 
+        if cmd == 'delete':
+            if len(rest) < 2:
+                print("Usage: mlx exp delete <id_prefix>")
+                sys.exit(1)
+            ok = core.delete_experiment(rest[1])
+            if not ok:
+                sys.exit(1)
+            return
+
         # Shorthand show: mlx exp <id_prefix>
         if len(rest) == 1 and not cmd.startswith('-'):
             exp = core.find_experiment_by_id(cmd)
@@ -279,7 +300,7 @@ def main():
             print(f"Added new experiment: {new_exp.name} with ID {str(new_exp.id)[:8]}")
             return
 
-        print("Invalid exp usage. Try:\n  mlx exp list\n  mlx exp show <id_prefix>\n  mlx exp <id_prefix>\n  mlx exp add <file_path> <name>\n  mlx exp <file_path> <name>")
+        print("Invalid exp usage. Try:\n  mlx exp list\n  mlx exp show <id_prefix>\n  mlx exp <id_prefix>\n  mlx exp add <file_path> <name>\n  mlx exp delete <id_prefix>\n  mlx exp <file_path> <name>")
         sys.exit(1)
 
     elif args.command == "setup":
