@@ -1,0 +1,42 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+site/
+
+# Test/coverage caches
+.pytest_cache/
+.coverage
+coverage.xml
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Local app/runtime data
+.mlx/
+.eve/
+progress.md
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Others not needed in VCS
+mlx_context.py
