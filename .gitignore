@@ -40,3 +40,8 @@ progress.md
 
 # Others not needed in VCS
 mlx_context.py
+
+# EVE specific files
+*.eve
+long_term_plan.md 
+progress.md

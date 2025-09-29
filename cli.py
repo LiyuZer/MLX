@@ -17,7 +17,8 @@ except ModuleNotFoundError:
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argparse parser for the MLX CLI.
 
-    This mirrors the previous parser defined in mlx_init.py (behavior preserved).
+    This mirrors the previous parser defined in mlx_init.py (behavior preserved),
+    with additional run options for streaming and parallelism.
     """
     parser = argparse.ArgumentParser(description="Initialize MLX environment.")
     subparsers = parser.add_subparsers(dest="command")
@@ -69,6 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     # run
     run_parser = subparsers.add_parser("run", help="Run an experiment")
     run_parser.add_argument("experiment_id", type=str, help="ID of the experiment to run")
+    run_parser.add_argument(
+        "--stream-all",
+        action="store_true",
+        help="Stream output for all parameter combinations during trials (sets MLX_STREAM_ALL=1)",
+    )
+    run_parser.add_argument(
+        "--parallel",
+        type=int,
+        default=None,
+        help="Run N combinations in parallel per trial (sets MLX_PARALLEL=N). Default is 1",
+    )
 
     # setup
     setup_parser = subparsers.add_parser("setup", help="Setup the MLX environment")
@@ -163,7 +175,7 @@ def _print_experiment_details(exp) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    """CLI entry point. Mirrors previous mlx_init.main behavior without change."""
+    """CLI entry point. Mirrors previous mlx_init.main behavior without change, with minor run options."""
     args = parse_args(argv)
     mlx_dir = ".mlx"
 
@@ -333,6 +345,32 @@ def main(argv: Optional[List[str]] = None) -> None:
         if not os.path.exists(mlx_dir):
             print("MLX environment not initialized. Please run 'mlx init' first.")
             sys.exit(1)
+        # Apply run-time options via environment seen by runner
+        if getattr(args, "stream_all", False):
+            os.environ["MLX_STREAM_ALL"] = "1"
+        if getattr(args, "parallel", None) is not None:
+            try:
+                if int(args.parallel) > 0:
+                    os.environ["MLX_PARALLEL"] = str(int(args.parallel))
+            except Exception:
+                pass
+
+        # Echo execution mode so users know how it will run
+        stream_all = os.environ.get("MLX_STREAM_ALL") == "1"
+        par_raw = os.environ.get("MLX_PARALLEL")
+        parallel = None
+        try:
+            if par_raw is not None:
+                parallel = int(par_raw)
+        except Exception:
+            parallel = None
+        mode_bits = []
+        mode_bits.append(f"parallel={parallel if parallel else '1 (default)'}")
+        mode_bits.append(f"stream={'all-combos' if stream_all else 'single-combo'}")
+        print("Run configuration: " + "; ".join(mode_bits))
+        if (parallel and parallel > 1) and stream_all:
+            print("Note: per-combination streaming is disabled in parallel mode; progress updates per completion.")
+
         core = MLXCore(mlx_dir)
         core.run_experiment(args.experiment_id)
 

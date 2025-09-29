@@ -436,6 +436,21 @@ def run_experiment_impl(core: Any, experiment: Any):
         print(f"{Fore.MAGENTA}{'─'*70}{Style.RESET_ALL}\n")
 
         for order, func_name, values, func_body in trial_funcs:
+            # Determine requested parallelism (reserved key) with env fallback
+            parallel = 1
+            env_parallel = os.environ.get("MLX_PARALLEL")
+            if env_parallel:
+                try:
+                    parallel = int(env_parallel)
+                except Exception:
+                    parallel = 1
+            if "__parallel__" in values:
+                try:
+                    parallel = int(values.pop("__parallel__"))
+                except Exception:
+                    pass
+            max_workers = max(1, min(parallel, (os.cpu_count() or 1)))
+
             arg_names = list(values.keys())
             arg_values = list(values.values())
             cartesian_product = list(it.product(*arg_values))
@@ -453,57 +468,147 @@ def run_experiment_impl(core: Any, experiment: Any):
                     leave=False,
                 )
 
+            # Streaming mode note
+            stream_all = (os.environ.get("MLX_STREAM_ALL") == "1")
+
             start_time = time.time()
             successful_runs = 0
             failed_runs = 0
 
-            for i, combination in enumerate(cartesian_product):
-                # Create temporary file for this trial run
-                temp_file_path = create_trial_temp_file(
-                    func_name,
-                    func_body,
-                    arg_names,
-                    combination,
-                    import_lines,
-                    other_code,
-                    base_dir,
-                    temp_dir=run_temp_dir,
-                )
-                temp_files.append(temp_file_path)
+            if max_workers > 1 and len(cartesian_product) > 0:
+                # Parallel execution: disable per-combo streaming to keep logs readable
+                print(f"  {Style.DIM}Parallel: {max_workers} worker(s); streaming: disabled (parallel){Style.RESET_ALL}")
+                try:
+                    import concurrent.futures as cf
+                except Exception:
+                    cf = None
 
-                # Show parameters
-                param_str = ", ".join([f"{k}={v}" for k, v in zip(arg_names, combination)])
-                if len(cartesian_product) > 1:
-                    progress_bar.set_description(f"  Running with {param_str}")
+                # Prepare tasks
+                results_buffer: list[dict | None] = [None] * len(cartesian_product)
+
+                if cf is None:
+                    # Fallback to sequential if futures unavailable
+                    for i, combination in enumerate(cartesian_product):
+                        temp_file_path = create_trial_temp_file(
+                            func_name,
+                            func_body,
+                            arg_names,
+                            combination,
+                            import_lines,
+                            other_code,
+                            base_dir,
+                            temp_dir=run_temp_dir,
+                        )
+                        temp_files.append(temp_file_path)
+
+                        param_str = ", ".join([f"{k}={v}" for k, v in zip(arg_names, combination)])
+                        if len(cartesian_product) > 1:
+                            progress_bar.set_description(f"  Running with {param_str}")
+                        else:
+                            print(f"  {Style.DIM}Parameters: {param_str}{Style.RESET_ALL}")
+
+                        result = execute_temp_file(temp_file_path, python_exe, base_dir, False)
+                        results_buffer[i] = result
+                        if len(cartesian_product) > 1:
+                            progress_bar.update(1)
                 else:
-                    print(f"  {Style.DIM}Parameters: {param_str}{Style.RESET_ALL}")
+                    with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_index = {}
+                        for i, combination in enumerate(cartesian_product):
+                            temp_file_path = create_trial_temp_file(
+                                func_name,
+                                func_body,
+                                arg_names,
+                                combination,
+                                import_lines,
+                                other_code,
+                                base_dir,
+                                temp_dir=run_temp_dir,
+                            )
+                            temp_files.append(temp_file_path)
+                            # No streaming per task in parallel mode
+                            if len(cartesian_product) > 1:
+                                param_str = ", ".join([f"{k}={v}" for k, v in zip(arg_names, combination)])
+                                progress_bar.set_description(f"  Running with {param_str}")
+                            fut = executor.submit(execute_temp_file, temp_file_path, python_exe, base_dir, False)
+                            future_to_index[fut] = i
 
-                # Execute the temp file
-                stream_output = (os.environ.get("MLX_STREAM_ALL") == "1") or (len(cartesian_product) == 1)
-                result = execute_temp_file(temp_file_path, python_exe, base_dir, stream_output)
+                        for fut in cf.as_completed(future_to_index):
+                            i = future_to_index[fut]
+                            try:
+                                res = fut.result()
+                            except Exception as e:
+                                res = {"success": False, "error": str(e), "type": type(e).__name__}
+                            results_buffer[i] = res
+                            if len(cartesian_product) > 1:
+                                progress_bar.update(1)
 
-                if not result.get("success", False):
-                    # Handle failure
-                    if stream_output:
-                        error_msg = result.get("error", "Unknown error")
-                        error_type = result.get("type", "Error")
-                        print(f"    {Fore.RED}✗ {error_type}: {error_msg}{Style.RESET_ALL}")
+                # Collate results in order
+                for res in results_buffer:
+                    res = res or {"success": False, "error": "Unknown error", "type": "Error"}
+                    if not res.get("success", False):
+                        trial_run.results[func_name].append(res)
+                        failed_runs += 1
+                    else:
+                        trial_run.results[func_name].append(res)
+                        successful_runs += 1
 
-                    trial_run.results[func_name].append(result)
-                    failed_runs += 1
-                else:
-                    # Handle success
-                    if stream_output:
-                        result_str = str(result.get("result", "No result"))
-                        if len(result_str) > 100:
-                            result_str = result_str[:97] + "..."
-                        print(f"    {Fore.GREEN}✓ Result: {result_str}{Style.RESET_ALL}")
+            else:
+                # Sequential execution (original behavior, with improved streaming)
+                if max_workers > 1:
+                    print(f"  {Style.DIM}Parallel requested: {parallel}, clamped to {max_workers}{Style.RESET_ALL}")
+                if stream_all and len(cartesian_product) > 1:
+                    print(f"  {Style.DIM}Streaming: all combinations (MLX_STREAM_ALL=1){Style.RESET_ALL}")
+                elif len(cartesian_product) == 1:
+                    print(f"  {Style.DIM}Streaming: single combination{Style.RESET_ALL}")
 
-                    trial_run.results[func_name].append(result)
-                    successful_runs += 1
+                for i, combination in enumerate(cartesian_product):
+                    # Create temporary file for this trial run
+                    temp_file_path = create_trial_temp_file(
+                        func_name,
+                        func_body,
+                        arg_names,
+                        combination,
+                        import_lines,
+                        other_code,
+                        base_dir,
+                        temp_dir=run_temp_dir,
+                    )
+                    temp_files.append(temp_file_path)
 
-                if len(cartesian_product) > 1:
-                    progress_bar.update(1)
+                    # Show parameters
+                    param_str = ", ".join([f"{k}={v}" for k, v in zip(arg_names, combination)])
+                    if len(cartesian_product) > 1:
+                        progress_bar.set_description(f"  Running with {param_str}")
+                    else:
+                        print(f"  {Style.DIM}Parameters: {param_str}{Style.RESET_ALL}")
+
+                    # Execute the temp file
+                    stream_output = stream_all or (len(cartesian_product) == 1)
+                    result = execute_temp_file(temp_file_path, python_exe, base_dir, stream_output)
+
+                    if not result.get("success", False):
+                        # Handle failure
+                        if stream_output:
+                            error_msg = result.get("error", "Unknown error")
+                            error_type = result.get("type", "Error")
+                            print(f"    {Fore.RED}✗ {error_type}: {error_msg}{Style.RESET_ALL}")
+
+                        trial_run.results[func_name].append(result)
+                        failed_runs += 1
+                    else:
+                        # Handle success
+                        if stream_output:
+                            result_str = str(result.get("result", "No result"))
+                            if len(result_str) > 100:
+                                result_str = result_str[:97] + "..."
+                            print(f"    {Fore.GREEN}✓ Result: {result_str}{Style.RESET_ALL}")
+
+                        trial_run.results[func_name].append(result)
+                        successful_runs += 1
+
+                    if len(cartesian_product) > 1:
+                        progress_bar.update(1)
 
             if len(cartesian_product) > 1:
                 progress_bar.close()
@@ -514,7 +619,6 @@ def run_experiment_impl(core: Any, experiment: Any):
                 f"  {Style.DIM}Successful: {successful_runs}/{len(cartesian_product)}, "
                 f"Failed: {failed_runs}/{len(cartesian_product)}{Style.RESET_ALL}\n"
             )
-
         # STEP 4: EXECUTE VERIFICATIONS
         if verify_funcs:
             print(f"{Fore.YELLOW}{'─'*70}{Style.RESET_ALL}")
