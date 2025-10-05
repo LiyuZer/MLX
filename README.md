@@ -128,9 +128,12 @@ mlx hypothesis conclude abcd1234 --status supports -m "Iterative method is relia
 - mlx exp list | show <exp_id_prefix>
 - mlx exp delete <exp_id_prefix>
 - mlx run <exp_id_prefix>
+- mlx reproduce [--dry-run] [--fail-fast] [--filter-status any|pending|running|validated|invalidated|inconclusive|invalid] [--stream-all]
+  - Runs all experiments sequentially through the hypothesis tree. Per-trial parallelism inside an experiment (via "__parallel__" or MLX_PARALLEL) is preserved.
 - mlx status <exp_id_prefix>
 - mlx log
 - mlx setup --env venv_path
+
 ## 🧹 Temp Files and Cleanup
 - Each run uses a dedicated directory: .mlx/tmp/run_<id>.
 - On normal exit or Ctrl+C, MLX cleans the run directory.
