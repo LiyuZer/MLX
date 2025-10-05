@@ -18,7 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argparse parser for the MLX CLI.
 
     This mirrors the previous parser defined in mlx_init.py (behavior preserved),
-    with additional run options for streaming and parallelism.
+    with additional run options for streaming and parallelism, and a new
+    reproduce subcommand to run the entire hypothesis tree.
     """
     parser = argparse.ArgumentParser(description="Initialize MLX environment.")
     subparsers = parser.add_subparsers(dest="command")
@@ -80,6 +81,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Run N combinations in parallel per trial (sets MLX_PARALLEL=N). Default is 1",
+    )
+
+    # reproduce
+    rep_parser = subparsers.add_parser("reproduce", help="Run all experiments in the hypothesis tree (sequentially)")
+    rep_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the experiments that would be run without executing",
+    )
+    rep_parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop at the first failure",
+    )
+    rep_parser.add_argument(
+        "--filter-status",
+        type=str,
+        choices=["any", "pending", "running", "validated", "invalidated", "inconclusive", "invalid"],
+        default="any",
+        help="Only run experiments matching this status (default: any)",
+    )
+    rep_parser.add_argument(
+        "--stream-all",
+        action="store_true",
+        help="Stream output for all parameter combinations during trials (sets MLX_STREAM_ALL=1)",
     )
 
     # setup
@@ -175,7 +201,7 @@ def _print_experiment_details(exp) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    """CLI entry point. Mirrors previous mlx_init.main behavior without change, with minor run options."""
+    """CLI entry point. Mirrors previous mlx_init.main behavior with minor run options and reproduce."""
     args = parse_args(argv)
     mlx_dir = ".mlx"
 
@@ -374,6 +400,83 @@ def main(argv: Optional[List[str]] = None) -> None:
         core = MLXCore(mlx_dir)
         core.run_experiment(args.experiment_id)
 
+    elif args.command == "reproduce":
+        if not os.path.exists(mlx_dir):
+            print("MLX environment not initialized. Please run 'mlx init' first.")
+            sys.exit(1)
+        # Apply stream-all to environment if requested
+        if getattr(args, "stream_all", False):
+            os.environ["MLX_STREAM_ALL"] = "1"
+
+        core = MLXCore(mlx_dir)
+        root = core.root_hypothesis
+        if not root:
+            print("No hypothesis tree initialized.")
+            return
+
+        def iter_experiments(h):
+            for e in getattr(h, 'experiments', []) or []:
+                yield h, e
+            for c in getattr(h, 'children', []) or []:
+                yield from iter_experiments(c)
+
+        todo = []
+        for h, e in iter_experiments(root):
+            status = (getattr(e, 'status', None) or '').lower()
+            if args.filter_status != 'any' and status != args.filter_status:
+                continue
+            todo.append((h, e))
+
+        if not todo:
+            print("No experiments matched the filter.")
+            return
+
+        print(f"Reproduce plan: {len(todo)} experiment(s)")
+        for h, e in todo:
+            print(f"  - {e.name} <{str(e.id)[:8]}> [{getattr(e, 'status', 'unknown')}] under {h.name}")
+        if args.dry_run:
+            return
+
+        failed = 0
+        succeeded = 0
+        inconclusive = 0
+
+        for h, e in todo:
+            print("\n=== Reproduce: Running", e.name, f"<{str(e.id)[:8]}>", "under", h.name, "===")
+            try:
+                core.run_experiment(str(e.id))
+            except SystemExit as se:
+                # Propagate non-zero exits as failures
+                failed += 1
+                if args.fail_fast:
+                    break
+                continue
+            except Exception as ex:
+                print("Run error:", ex)
+                failed += 1
+                if args.fail_fast:
+                    break
+                continue
+
+            # After run, experiment status should be updated in core
+            status = (getattr(e, 'status', None) or '').lower()
+            if status in ("invalid", "invalidated"):
+                failed += 1
+                if args.fail_fast:
+                    break
+            elif status in ("validated",):
+                succeeded += 1
+            else:
+                inconclusive += 1
+
+        print("\n==== Reproduce Summary ====")
+        print(f"  Total: {len(todo)}")
+        print(f"  Succeeded: {succeeded}")
+        print(f"  Inconclusive: {inconclusive}")
+        print(f"  Failed: {failed}")
+        if failed > 0:
+            sys.exit(1)
+
     elif args.command == "status":
         if not os.path.exists(mlx_dir):
             print("MLX environment not initialized. Please run 'mlx init' first.")
@@ -389,7 +492,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         core.print_log()
 
     else:
-        print("No command specified. Use one of: init, hypothesis, exp, run, setup, status, log")
+        print("No command specified. Use one of: init, hypothesis, exp, run, reproduce, setup, status, log")
         sys.exit(1)
 
 
