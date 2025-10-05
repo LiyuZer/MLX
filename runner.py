@@ -12,7 +12,7 @@ import shutil
 import atexit
 import signal
 import itertools as it
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from colorama import Fore, Style
 from tqdm import tqdm
@@ -24,6 +24,10 @@ from decorators import VerificationResult
 from models import TrialRun
 
 
+# ---------------------------------------
+# Parsing helpers
+# ---------------------------------------
+
 def make_function(
     func_name: str,
     func_body: str,
@@ -33,7 +37,7 @@ def make_function(
 ) -> str:
     """
     Build a small Python program string that defines a function and invokes it,
-    printing a JSON result. Preserved from original implementation for API parity.
+    printing a JSON result. Preserved for API parity (not used in current flow).
     """
     func_string = f"{import_lines}\n"
     func_string += "import json\n"
@@ -52,20 +56,33 @@ def make_function(
 
 
 def extract_file_components(file_content: str):
-    """Extract trials, verifications, import lines, and other code segments from a file."""
+    """
+    Extract trials, verifications, setup functions, import lines, and other code segments from a file.
+
+    Returns:
+      trial_funcs: List[Tuple[int, str, Dict[str, List[Any]], str]]
+      verify_funcs: List[Tuple[str, List[str], ast.FunctionDef]]
+      setup_funcs: List[Tuple[Optional[int], str, ast.FunctionDef]]
+      import_lines: List[str]
+      other_code: List[str]
+    """
     tree = ast.parse(file_content)
     trial_funcs: List[Tuple[int, str, Dict[str, List[Any]], str]] = []
-    verify_funcs = []
+    verify_funcs: List[Tuple[str, List[str], ast.FunctionDef]] = []
+    setup_funcs: List[Tuple[Optional[int], str, ast.FunctionDef]] = []
     import_lines: List[str] = []
     other_code: List[str] = []  # Classes, helper functions, constants
 
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            import_lines.append(ast.get_source_segment(file_content, node))
+            seg = ast.get_source_segment(file_content, node)
+            if seg is not None:
+                import_lines.append(seg)
         elif isinstance(node, ast.FunctionDef):
-            # Check if this function has trial or verify decorators
+            # Check decorators
             has_trial = False
             has_verify = False
+            has_setup = False
 
             for decorator in node.decorator_list:
                 if isinstance(decorator, ast.Call):
@@ -87,7 +104,9 @@ def extract_file_components(file_content: str):
                                 values = ast.literal_eval(decorator.args[1])
                         if order is not None and values is not None:
                             func_body = "\n".join([ast.unparse(stmt) for stmt in node.body])
-                            trial_funcs.append((order, node.name, values, func_body))
+                            # Normalize order to int for sorting (fallback to large number)
+                            order_val = int(order)
+                            trial_funcs.append((order_val, node.name, values, func_body))
                             has_trial = True
                     elif func_id == 'verify':
                         trial_names: List[str] = []
@@ -101,9 +120,21 @@ def extract_file_components(file_content: str):
                                 trial_names = ast.literal_eval(decorator.args[0])
                         verify_funcs.append((node.name, trial_names, node))
                         has_verify = True
+                    elif func_id == 'setup':
+                        order: Optional[int] = None
+                        # Keyword arg: setup(order=...)
+                        for kw in decorator.keywords:
+                            if kw.arg == 'order':
+                                order = ast.literal_eval(kw.value)
+                        # Positional arg: setup(order)
+                        if order is None and getattr(decorator, 'args', None):
+                            if len(decorator.args) >= 1:
+                                order = ast.literal_eval(decorator.args[0])
+                        setup_funcs.append((order, node.name, node))
+                        has_setup = True
 
-            # If function doesn't have trial/verify decorators, include it as helper code
-            if not has_trial and not has_verify:
+            # If function doesn't have trial/verify/setup decorators, include it as helper code
+            if not has_trial and not has_verify and not has_setup:
                 seg = ast.get_source_segment(file_content, node)
                 if seg is not None:
                     other_code.append(seg)
@@ -113,8 +144,35 @@ def extract_file_components(file_content: str):
             if seg is not None:
                 other_code.append(seg)
 
-    trial_funcs.sort(key=lambda x: x[0])  # Sort by order
-    return trial_funcs, verify_funcs, import_lines, other_code
+    # Sort trials by order
+    trial_funcs.sort(key=lambda x: x[0])
+    # Sort setup funcs: those with order first by order, otherwise preserve discovery order
+    setup_with_order = [(o, n, nd) for (o, n, nd) in setup_funcs if o is not None]
+    setup_no_order = [(o, n, nd) for (o, n, nd) in setup_funcs if o is None]
+    setup_with_order.sort(key=lambda x: x[0])
+    setup_funcs_sorted: List[Tuple[Optional[int], str, ast.FunctionDef]] = setup_with_order + setup_no_order
+
+    return trial_funcs, verify_funcs, setup_funcs_sorted, import_lines, other_code
+
+
+# ---------------------------------------
+# Temp file builders (trial / verify / setup)
+# ---------------------------------------
+
+def _seed_block_lines() -> List[str]:
+    """Generate seeding code lines that use a global SETUP dict if present."""
+    lines: List[str] = []
+    # Safe best-effort seeding based on SETUP
+    lines.append("# --- MLX auto-seeding (best-effort) ---")
+    lines.append("seed = (SETUP.get('seed') if isinstance(SETUP, dict) else None)")
+    lines.append("numpy_seed = SETUP.get('numpy_seed', seed) if isinstance(SETUP, dict) else None")
+    lines.append("torch_seed = SETUP.get('torch_seed', seed) if isinstance(SETUP, dict) else None")
+    lines.append("pythonhashseed = SETUP.get('pythonhashseed', seed) if isinstance(SETUP, dict) else None")
+    lines.append("try:\n    import os as _os_seed\n    import random as _random_seed\n    if pythonhashseed is not None:\n        _os_seed.environ['PYTHONHASHSEED'] = str(int(pythonhashseed))\n    if seed is not None:\n        _random_seed.seed(int(seed))\nexcept Exception:\n    pass")
+    lines.append("try:\n    import numpy as _np_seed\n    if numpy_seed is not None:\n        _np_seed.random.seed(int(numpy_seed))\nexcept Exception:\n    pass")
+    lines.append("try:\n    import torch as _torch_seed\n    if torch_seed is not None:\n        _torch_seed.manual_seed(int(torch_seed))\n        if hasattr(_torch_seed, 'cuda') and _torch_seed.cuda.is_available():\n            _torch_seed.cuda.manual_seed_all(int(torch_seed))\n        try:\n            import torch.backends.cudnn as _cudnn\n            _cudnn.deterministic = True\n            _cudnn.benchmark = False\n        except Exception:\n            pass\nexcept Exception:\n    pass")
+    lines.append("# --- end auto-seeding ---")
+    return lines
 
 
 def create_trial_temp_file(
@@ -125,9 +183,10 @@ def create_trial_temp_file(
     import_lines: List[str],
     other_code: List[str],
     base_dir: str,
+    run_context: Dict[str, Any],
     temp_dir: str | None = None,
 ) -> str:
-    """Create a temporary file for executing a single trial"""
+    """Create a temporary file for executing a single trial."""
     # Build the complete file content
     file_content: List[str] = []
 
@@ -135,6 +194,13 @@ def create_trial_temp_file(
     file_content.extend(import_lines)
     file_content.append("import json")
     file_content.append("import sys")
+    file_content.append("import os")
+    file_content.append("")
+
+    # Inject setup context
+    setup_json = json.dumps(run_context or {})
+    file_content.append(f"SETUP = {setup_json}")
+    file_content.extend(_seed_block_lines())
     file_content.append("")
 
     # Add other code (classes, helper functions, constants)
@@ -152,9 +218,9 @@ def create_trial_temp_file(
     file_content.append(f"def wrapper_{func_name}():")
     file_content.append("    try:")
     file_content.append(f"        result = {func_name}({', '.join(function_inside_args)})")
-    file_content.append('        print(json.dumps({"result": result}))')
+    file_content.append("        print(json.dumps({\"result\": result}))")
     file_content.append("    except Exception as e:")
-    file_content.append('        print(json.dumps({"error": str(e), "type": type(e).__name__}), file=sys.stderr)')
+    file_content.append("        print(json.dumps({\"error\": str(e), \"type\": type(e).__name__}), file=sys.stderr)")
     file_content.append("        sys.exit(1)")
     file_content.append("")
     file_content.append(f"wrapper_{func_name}()")
@@ -175,9 +241,10 @@ def create_verify_temp_file(
     import_lines: List[str],
     other_code: List[str],
     base_dir: str,
+    run_context: Dict[str, Any],
     temp_dir: str | None = None,
 ) -> str:
-    """Create a temporary file for executing a verification"""
+    """Create a temporary file for executing a verification."""
     file_content: List[str] = []
 
     # Add imports
@@ -187,7 +254,14 @@ def create_verify_temp_file(
     file_content.append("from enum import Enum")
     file_content.append("")
 
-    # Add VerificationResult enum
+    # Inject setup context
+    setup_json = json.dumps(run_context or {})
+    file_content.append(f"SETUP = {setup_json}")
+    # (Seeding not strictly necessary here, but harmless)
+    file_content.extend(_seed_block_lines())
+    file_content.append("")
+
+    # Add VerificationResult enum (self-contained)
     file_content.append("class VerificationResult(Enum):")
     file_content.append("    SUPPORTS = 'supports'")
     file_content.append("    REFUTES = 'refutes'")
@@ -213,9 +287,9 @@ def create_verify_temp_file(
     file_content.append(f"        result = {verify_name}({repr(trial_results)})")
     file_content.append("        if hasattr(result, 'value'):")
     file_content.append("            result = result.value")
-    file_content.append('        print(json.dumps({"result": result}))')
+    file_content.append("        print(json.dumps({\"result\": result}))")
     file_content.append("    except Exception as e:")
-    file_content.append('        print(json.dumps({"error": str(e), "type": type(e).__name__}), file=sys.stderr)')
+    file_content.append("        print(json.dumps({\"error\": str(e), \"type\": type(e).__name__}), file=sys.stderr)")
     file_content.append("        sys.exit(1)")
     file_content.append("")
     file_content.append(f"wrapper_{verify_name}()")
@@ -228,6 +302,67 @@ def create_verify_temp_file(
 
     return temp_file.name
 
+
+def create_setup_temp_file(
+    setup_name: str,
+    setup_node: ast.FunctionDef,
+    import_lines: List[str],
+    other_code: List[str],
+    base_dir: str,
+    run_context: Dict[str, Any],
+    temp_dir: str | None = None,
+) -> str:
+    """Create a temporary file for executing a setup function once to produce run context.
+
+    We do NOT auto-seed before setup; users typically return seeds here.
+    """
+    file_content: List[str] = []
+
+    # Add imports
+    file_content.extend(import_lines)
+    file_content.append("import json")
+    file_content.append("import sys")
+    file_content.append("")
+
+    # Current (possibly empty) context is provided as SETUP for convenience
+    setup_json = json.dumps(run_context or {})
+    file_content.append(f"SETUP = {setup_json}")
+    file_content.append("")
+
+    # Add other code
+    file_content.extend(other_code)
+    file_content.append("")
+
+    # Add setup function
+    func_body = "\n".join([ast.unparse(stmt) for stmt in setup_node.body])
+    file_content.append(f"def {setup_name}():")
+    for line in func_body.splitlines():
+        file_content.append("    " + line)
+    file_content.append("")
+
+    # Add wrapper
+    file_content.append(f"def wrapper_{setup_name}():")
+    file_content.append("    try:")
+    file_content.append(f"        result = {setup_name}()")
+    file_content.append("        print(json.dumps({\"result\": result}))")
+    file_content.append("    except Exception as e:")
+    file_content.append("        print(json.dumps({\"error\": str(e), \"type\": type(e).__name__}), file=sys.stderr)")
+    file_content.append("        sys.exit(1)")
+    file_content.append("")
+    file_content.append(f"wrapper_{setup_name}()")
+
+    # Create temporary file
+    directory = temp_dir if temp_dir else base_dir
+    temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', dir=directory, delete=False)
+    temp_file.write('\n'.join(file_content))
+    temp_file.close()
+
+    return temp_file.name
+
+
+# ---------------------------------------
+# Execution helper
+# ---------------------------------------
 
 def execute_temp_file(
     temp_file_path: str,
@@ -339,10 +474,19 @@ def execute_temp_file(
             'error': str(e),
             'type': type(e).__name__
         }
+
+
+# ---------------------------------------
+# Orchestration
+# ---------------------------------------
+
 def run_experiment_impl(core: Any, experiment: Any):
     """
-    Orchestrate an experiment run. Behavior mirrors MLXCore.run_experiment to preserve
-    output and side effects. Returns (run_id, TrialRun).
+    Orchestrate an experiment run with support for:
+      - @setup run-level context (JSON-serializable)
+      - Automatic seeding (random/numpy/torch) per combination based on context
+      - Parallel execution per-trial via reserved "__parallel__" values key (env MLX_PARALLEL)
+      - Streaming stdout+stderr with optional MLX_STREAM_ALL toggle
     """
     # STEP 0: VALIDATION
     if not experiment:
@@ -418,10 +562,53 @@ def run_experiment_impl(core: Any, experiment: Any):
         temp_files: list[str] = []  # Track temp files for cleanup (extra safety)
 
         # Extract components from file
-        trial_funcs, verify_funcs, import_lines, other_code = extract_file_components(file_content)
+        trial_funcs, verify_funcs, setup_funcs, import_lines, other_code = extract_file_components(file_content)
 
-        print(f"  {Fore.GREEN}✓{Style.RESET_ALL} Found {len(trial_funcs)} trial(s) and {len(verify_funcs)} verification(s)")
+        print(f"  {Fore.GREEN}✓{Style.RESET_ALL} Found {len(trial_funcs)} trial(s), {len(verify_funcs)} verification(s)")
+        if setup_funcs:
+            print(f"  {Style.DIM}Setup functions: {len(setup_funcs)}{Style.RESET_ALL}")
         print(f"  {Style.DIM}Helper code segments: {len(other_code)}{Style.RESET_ALL}\n")
+
+        # STEP 1b: RUN SETUP (once) to produce run-level context
+        run_context: Dict[str, Any] = {}
+        if setup_funcs:
+            print(f"{Fore.BLUE}◆ Running setup...{Style.RESET_ALL}")
+            for order, setup_name, setup_node in setup_funcs:
+                temp_file_path = create_setup_temp_file(
+                    setup_name,
+                    setup_node,
+                    import_lines,
+                    other_code,
+                    base_dir,
+                    run_context,
+                    temp_dir=run_temp_dir,
+                )
+                temp_files.append(temp_file_path)
+                start_time = time.time()
+                res = execute_temp_file(temp_file_path, python_exe, base_dir, True)
+                elapsed = time.time() - start_time
+                if not res.get("success", False):
+                    error_msg = res.get("error", "Unknown error")
+                    error_type = res.get("type", "Error")
+                    print(f"    {Fore.RED}✗ {error_type}: {error_msg}{Style.RESET_ALL}")
+                    print(f"    {Style.DIM}Setup '{setup_name}' failed; aborting run.{Style.RESET_ALL}")
+                    return
+                # Merge JSON-serializable context
+                ctx = res.get("result")
+                # Allow non-dict returns by wrapping under function name
+                if isinstance(ctx, dict):
+                    merge_candidate = ctx
+                else:
+                    merge_candidate = {setup_name: ctx}
+                # Ensure serializable
+                try:
+                    json.dumps(merge_candidate)
+                except Exception:
+                    print(f"    {Fore.RED}✗ Setup '{setup_name}' returned a non-serializable object{Style.RESET_ALL}")
+                    return
+                run_context.update(merge_candidate)
+                print(f"    {Fore.GREEN}✓ Setup '{setup_name}' completed in {elapsed:.3f}s{Style.RESET_ALL}")
+            print()
 
         # STEP 2: INITIALIZE RUN
         trial_names = [name for _, name, _, _ in trial_funcs]
@@ -450,6 +637,11 @@ def run_experiment_impl(core: Any, experiment: Any):
                 except Exception:
                     pass
             max_workers = max(1, min(parallel, (os.cpu_count() or 1)))
+
+            # Disallow reserved name 'setup' inside values
+            if "setup" in values:
+                print(f"  {Fore.RED}✗ Parameter name 'setup' is reserved and cannot be used in trial values.{Style.RESET_ALL}")
+                return
 
             arg_names = list(values.keys())
             arg_values = list(values.values())
@@ -497,6 +689,7 @@ def run_experiment_impl(core: Any, experiment: Any):
                             import_lines,
                             other_code,
                             base_dir,
+                            run_context,
                             temp_dir=run_temp_dir,
                         )
                         temp_files.append(temp_file_path)
@@ -523,6 +716,7 @@ def run_experiment_impl(core: Any, experiment: Any):
                                 import_lines,
                                 other_code,
                                 base_dir,
+                                run_context,
                                 temp_dir=run_temp_dir,
                             )
                             temp_files.append(temp_file_path)
@@ -543,15 +737,24 @@ def run_experiment_impl(core: Any, experiment: Any):
                             if len(cartesian_product) > 1:
                                 progress_bar.update(1)
 
-                # Collate results in order
+                # Collate results in order, merging any context updates post-batch
                 for res in results_buffer:
                     res = res or {"success": False, "error": "Unknown error", "type": "Error"}
                     if not res.get("success", False):
                         trial_run.results[func_name].append(res)
                         failed_runs += 1
                     else:
+                        # Handle success
                         trial_run.results[func_name].append(res)
                         successful_runs += 1
+                        # Merge context update if provided
+                        r = res.get("result")
+                        if isinstance(r, dict) and isinstance(r.get("context_update"), dict):
+                            try:
+                                json.dumps(r["context_update"])  # ensure serializable
+                                run_context.update(r["context_update"])  # post-batch merge
+                            except Exception:
+                                pass
 
             else:
                 # Sequential execution (original behavior, with improved streaming)
@@ -572,6 +775,7 @@ def run_experiment_impl(core: Any, experiment: Any):
                         import_lines,
                         other_code,
                         base_dir,
+                        run_context,
                         temp_dir=run_temp_dir,
                     )
                     temp_files.append(temp_file_path)
@@ -606,6 +810,14 @@ def run_experiment_impl(core: Any, experiment: Any):
 
                         trial_run.results[func_name].append(result)
                         successful_runs += 1
+                        # Merge context update immediately (sequential)
+                        r = result.get("result")
+                        if isinstance(r, dict) and isinstance(r.get("context_update"), dict):
+                            try:
+                                json.dumps(r["context_update"])  # ensure serializable
+                                run_context.update(r["context_update"])  # immediate merge
+                            except Exception:
+                                pass
 
                     if len(cartesian_product) > 1:
                         progress_bar.update(1)
@@ -619,6 +831,7 @@ def run_experiment_impl(core: Any, experiment: Any):
                 f"  {Style.DIM}Successful: {successful_runs}/{len(cartesian_product)}, "
                 f"Failed: {failed_runs}/{len(cartesian_product)}{Style.RESET_ALL}\n"
             )
+
         # STEP 4: EXECUTE VERIFICATIONS
         if verify_funcs:
             print(f"{Fore.YELLOW}{'─'*70}{Style.RESET_ALL}")
@@ -646,6 +859,7 @@ def run_experiment_impl(core: Any, experiment: Any):
                     import_lines,
                     other_code,
                     base_dir,
+                    run_context,
                     temp_dir=run_temp_dir,
                 )
                 temp_files.append(temp_file_path)

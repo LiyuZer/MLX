@@ -1,8 +1,8 @@
 '''
 Lightweight decorator markers for MLX.
 
-These decorators are simple wrappers. MLXCore extracts metadata by parsing your
-experiment file's AST, so the wrappers do not alter runtime behavior. They only:
+These decorators are simple wrappers. MLX parses your experiment file's AST,
+so the wrappers do not alter runtime behavior. They only:
   - Preserve function identity
   - Accept positional or keyword arguments (to match examples)
   - Attach attributes for human readability and potential introspection
@@ -15,6 +15,10 @@ Usage
 
 @verify(["trial1", "trial2"]) or @verify(trial_names=[...])
   - trial_names: list[str] of trial function names whose results to verify.
+
+@setup(order: int | None = None)
+  - Runs once before trials to produce a run-level context (JSON-serializable dict).
+  - The runner will expose this context to trials/verification (details in docs).
 
 Verification return values
 --------------------------
@@ -54,7 +58,7 @@ def trial(
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            # Intentionally no behavior changes — MLXCore executes reconstructed code.
+            # Intentionally no behavior changes — MLX reconstructs and executes code separately.
             return func(*args, **kwargs)
 
         # Attach helpful attributes for humans/future tooling
@@ -77,11 +81,38 @@ def verify(trial_names: Optional[List[str]] = None):
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            # Intentionally no behavior changes — MLXCore executes reconstructed code.
+            # Intentionally no behavior changes — MLX reconstructs and executes code separately.
             return func(*args, **kwargs)
 
         setattr(wrapper, "__mlx_verify__", True)
         setattr(wrapper, "__mlx_verify_trials__", trial_names or [])
+        return wrapper
+
+    return decorator
+
+
+def setup(order: Optional[int] = None):
+    """Mark a function as a one-time setup step for the run.
+
+    The function should return a JSON-serializable dict that represents the
+    run-level context (e.g., seeds, paths, configuration). The runner will run
+    setup before any trials and make the context available to trials and
+    verification (see documentation for specifics and limitations).
+
+    Example:
+        @setup(order=1)
+        def init():
+            return {"seed": 42, "numpy_seed": 42, "torch_seed": 42}
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # No behavior change at definition site.
+            return func(*args, **kwargs)
+
+        setattr(wrapper, "__mlx_setup__", True)
+        setattr(wrapper, "__mlx_order__", order)
         return wrapper
 
     return decorator
